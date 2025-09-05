@@ -6,8 +6,12 @@
 (define-constant ERR-INSUFFICIENT-REPUTATION (err u105))
 (define-constant ERR-PROPOSAL-NOT-ENDED (err u106))
 (define-constant ERR-PROPOSAL-ALREADY-EXECUTED (err u107))
+(define-constant ERR-INVALID-CATEGORY (err u108))
 
 (define-constant MIN-REPUTATION-TO-PROPOSE u10)
+(define-constant CATEGORY-GOVERNANCE u1)
+(define-constant CATEGORY-TREASURY u2)
+(define-constant CATEGORY-TECHNICAL u3)
 (define-constant VOTING-PERIOD u144)
 (define-constant QUORUM-THRESHOLD u50)
 
@@ -24,6 +28,7 @@
     proposer: principal,
     title: (string-ascii 50),
     description: (string-ascii 200),
+    category: uint,
     start-block: uint,
     end-block: uint,
     yes-votes: uint,
@@ -32,12 +37,38 @@
     executed: bool
 })
 
+(define-map category-config uint {
+    min-reputation: uint,
+    quorum-multiplier: uint,
+    voting-weight-multiplier: uint
+})
+
 (define-map votes { proposal-id: uint, voter: principal } {
     vote: bool,
     reputation-weight: uint
 })
 
 (define-map reputation-actions principal uint)
+
+(define-private (init-category-configs)
+    (begin
+        (map-set category-config CATEGORY-GOVERNANCE {
+            min-reputation: u20,
+            quorum-multiplier: u2,
+            voting-weight-multiplier: u1
+        })
+        (map-set category-config CATEGORY-TREASURY {
+            min-reputation: u50,
+            quorum-multiplier: u3,
+            voting-weight-multiplier: u2
+        })
+        (map-set category-config CATEGORY-TECHNICAL {
+            min-reputation: u10,
+            quorum-multiplier: u1,
+            voting-weight-multiplier: u1
+        })))
+
+(init-category-configs)
 
 (define-public (register-member)
     (let ((caller tx-sender))
@@ -61,15 +92,20 @@
         }))
         (ok true)))
 
-(define-public (create-proposal (title (string-ascii 50)) (description (string-ascii 200)))
+(define-public (create-proposal (title (string-ascii 50)) (description (string-ascii 200)) (category uint))
     (let ((caller tx-sender)
           (member-data (unwrap! (map-get? members caller) ERR-NOT-AUTHORIZED))
+          (category-data (unwrap! (map-get? category-config category) ERR-INVALID-CATEGORY))
           (proposal-id (var-get next-proposal-id)))
-        (asserts! (>= (get reputation member-data) MIN-REPUTATION-TO-PROPOSE) ERR-INSUFFICIENT-REPUTATION)
+        (asserts! (or (is-eq category CATEGORY-GOVERNANCE) 
+                     (is-eq category CATEGORY-TREASURY) 
+                     (is-eq category CATEGORY-TECHNICAL)) ERR-INVALID-CATEGORY)
+        (asserts! (>= (get reputation member-data) (get min-reputation category-data)) ERR-INSUFFICIENT-REPUTATION)
         (map-set proposals proposal-id {
             proposer: caller,
             title: title,
             description: description,
+            category: category,
             start-block: stacks-block-height,
             end-block: (+ stacks-block-height VOTING-PERIOD),
             yes-votes: u0,
@@ -84,7 +120,9 @@
     (let ((caller tx-sender)
           (member-data (unwrap! (map-get? members caller) ERR-NOT-AUTHORIZED))
           (proposal (unwrap! (map-get? proposals proposal-id) ERR-PROPOSAL-NOT-FOUND))
-          (reputation-weight (get reputation member-data)))
+          (category-data (unwrap! (map-get? category-config (get category proposal)) ERR-INVALID-CATEGORY))
+          (base-reputation (get reputation member-data))
+          (reputation-weight (* base-reputation (get voting-weight-multiplier category-data))))
         (asserts! (<= stacks-block-height (get end-block proposal)) ERR-VOTING-ENDED)
         (asserts! (is-none (map-get? votes { proposal-id: proposal-id, voter: caller })) ERR-ALREADY-VOTED)
         (map-set votes { proposal-id: proposal-id, voter: caller } {
@@ -104,10 +142,12 @@
         (ok true)))
 
 (define-public (execute-proposal (proposal-id uint))
-    (let ((proposal (unwrap! (map-get? proposals proposal-id) ERR-PROPOSAL-NOT-FOUND)))
+    (let ((proposal (unwrap! (map-get? proposals proposal-id) ERR-PROPOSAL-NOT-FOUND))
+          (category-data (unwrap! (map-get? category-config (get category proposal)) ERR-INVALID-CATEGORY))
+          (required-quorum (* QUORUM-THRESHOLD (get quorum-multiplier category-data))))
         (asserts! (> stacks-block-height (get end-block proposal)) ERR-PROPOSAL-NOT-ENDED)
         (asserts! (not (get executed proposal)) ERR-PROPOSAL-ALREADY-EXECUTED)
-        (asserts! (>= (get total-reputation-voted proposal) QUORUM-THRESHOLD) ERR-INSUFFICIENT-REPUTATION)
+        (asserts! (>= (get total-reputation-voted proposal) required-quorum) ERR-INSUFFICIENT-REPUTATION)
         (if (> (get yes-votes proposal) (get no-votes proposal))
             (begin
                 (map-set proposals proposal-id (merge proposal { executed: true }))
@@ -154,6 +194,15 @@
     (match (map-get? proposals proposal-id)
         proposal (<= stacks-block-height (get end-block proposal))
         false))
+
+(define-read-only (get-category-config (category uint))
+    (map-get? category-config category))
+
+(define-read-only (get-effective-voting-weight (member principal) (category uint))
+    (let ((member-data (unwrap! (map-get? members member) u0))
+          (category-data (unwrap! (map-get? category-config category) u0))
+          (base-reputation (get reputation member-data)))
+        (* base-reputation (get voting-weight-multiplier category-data))))
 
 (define-read-only (calculate-voting-power (member principal))
     (let ((member-data (unwrap! (map-get? members member) u0))
