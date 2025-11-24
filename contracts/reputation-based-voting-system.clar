@@ -7,6 +7,8 @@
 (define-constant ERR-PROPOSAL-NOT-ENDED (err u106))
 (define-constant ERR-PROPOSAL-ALREADY-EXECUTED (err u107))
 (define-constant ERR-INVALID-CATEGORY (err u108))
+(define-constant ERR-PROPOSAL-CANCELLED (err u109))
+(define-constant ERR-CANNOT-CANCEL (err u110))
 
 (define-constant MIN-REPUTATION-TO-PROPOSE u10)
 (define-constant CATEGORY-GOVERNANCE u1)
@@ -14,6 +16,7 @@
 (define-constant CATEGORY-TECHNICAL u3)
 (define-constant VOTING-PERIOD u144)
 (define-constant QUORUM-THRESHOLD u50)
+(define-constant CANCELLATION-PENALTY u3)
 
 (define-data-var next-proposal-id uint u1)
 (define-data-var contract-owner principal tx-sender)
@@ -34,7 +37,8 @@
     yes-votes: uint,
     no-votes: uint,
     total-reputation-voted: uint,
-    executed: bool
+    executed: bool,
+    cancelled: bool
 })
 
 (define-map category-config uint {
@@ -111,7 +115,8 @@
             yes-votes: u0,
             no-votes: u0,
             total-reputation-voted: u0,
-            executed: false
+            executed: false,
+            cancelled: false
         })
         (var-set next-proposal-id (+ proposal-id u1))
         (ok proposal-id)))
@@ -123,6 +128,7 @@
           (category-data (unwrap! (map-get? category-config (get category proposal)) ERR-INVALID-CATEGORY))
           (base-reputation (get reputation member-data))
           (reputation-weight (* base-reputation (get voting-weight-multiplier category-data))))
+        (asserts! (not (get cancelled proposal)) ERR-PROPOSAL-CANCELLED)
         (asserts! (<= stacks-block-height (get end-block proposal)) ERR-VOTING-ENDED)
         (asserts! (is-none (map-get? votes { proposal-id: proposal-id, voter: caller })) ERR-ALREADY-VOTED)
         (map-set votes { proposal-id: proposal-id, voter: caller } {
@@ -145,6 +151,7 @@
     (let ((proposal (unwrap! (map-get? proposals proposal-id) ERR-PROPOSAL-NOT-FOUND))
           (category-data (unwrap! (map-get? category-config (get category proposal)) ERR-INVALID-CATEGORY))
           (required-quorum (* QUORUM-THRESHOLD (get quorum-multiplier category-data))))
+        (asserts! (not (get cancelled proposal)) ERR-PROPOSAL-CANCELLED)
         (asserts! (> stacks-block-height (get end-block proposal)) ERR-PROPOSAL-NOT-ENDED)
         (asserts! (not (get executed proposal)) ERR-PROPOSAL-ALREADY-EXECUTED)
         (asserts! (>= (get total-reputation-voted proposal) required-quorum) ERR-INSUFFICIENT-REPUTATION)
@@ -156,6 +163,21 @@
             (begin
                 (map-set proposals proposal-id (merge proposal { executed: true }))
                 (ok false)))))
+
+(define-public (cancel-proposal (proposal-id uint))
+    (let ((caller tx-sender)
+          (proposal (unwrap! (map-get? proposals proposal-id) ERR-PROPOSAL-NOT-FOUND))
+          (member-data (unwrap! (map-get? members caller) ERR-NOT-AUTHORIZED)))
+        (asserts! (is-eq caller (get proposer proposal)) ERR-NOT-AUTHORIZED)
+        (asserts! (<= stacks-block-height (get end-block proposal)) ERR-VOTING-ENDED)
+        (asserts! (not (get cancelled proposal)) ERR-PROPOSAL-ALREADY-EXECUTED)
+        (asserts! (not (get executed proposal)) ERR-PROPOSAL-ALREADY-EXECUTED)
+        (asserts! (>= (get reputation member-data) CANCELLATION-PENALTY) ERR-INSUFFICIENT-REPUTATION)
+        (map-set proposals proposal-id (merge proposal { cancelled: true }))
+        (map-set members caller (merge member-data {
+            reputation: (- (get reputation member-data) CANCELLATION-PENALTY)
+        }))
+        (ok true)))
 
 (define-public (delegate-reputation (to-member principal) (amount uint))
     (let ((caller tx-sender)
@@ -192,7 +214,7 @@
 
 (define-read-only (is-proposal-active (proposal-id uint))
     (match (map-get? proposals proposal-id)
-        proposal (<= stacks-block-height (get end-block proposal))
+        proposal (and (<= stacks-block-height (get end-block proposal)) (not (get cancelled proposal)))
         false))
 
 (define-read-only (get-category-config (category uint))
